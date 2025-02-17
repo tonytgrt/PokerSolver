@@ -1,10 +1,12 @@
+# begin main.py
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import pandas as pd
 import numpy as np
 import random
-
+from gto import OpponentCardPredictor  # Import the model from gto.py
+import itertools
 
 # --------------------------
 # Data Structures for Cards and Hands
@@ -31,10 +33,9 @@ class Card:
     def __repr__(self):
         return f"{self.rank}{self.suit}"
 
-
 class PokerHand:
     def __init__(self, hole_cards, community_cards):
-        # hole_cards and community_cards should be list of card strings.
+        # hole_cards and community_cards should be lists of card strings.
         self.hole_cards = [Card(card) for card in hole_cards]
         self.community_cards = [Card(card) for card in community_cards]
 
@@ -49,7 +50,6 @@ class PokerHand:
         community = ", ".join(str(card) for card in self.community_cards)
         hand_rank = self.evaluate()
         return f"Hole Cards: [{hole}] | Community Cards: [{community}]  -->  {hand_rank}"
-
 
 # --------------------------
 # Hand Evaluation Function
@@ -146,28 +146,83 @@ def evaluate_poker_hand(cards):
         high_card = max(cards, key=lambda card: rank_values[card.rank])
         return f"High Card {rank_full(high_card.rank)} of {suit_full(high_card.suit)}"
 
+# --------------------------
+# Convert Hand Description into a Numeric Rank (for Simulation Comparison)
+# --------------------------
+def hand_rank_value(hand_description):
+    hand_order = {
+        "Straight Flush": 9,
+        "Four of a Kind": 8,
+        "Full House": 7,
+        "Flush": 6,
+        "Straight": 5,
+        "Three of a Kind": 4,
+        "Two Pair": 3,
+        "Pair": 2,
+        "High Card": 1
+    }
+    for key, val in hand_order.items():
+        if hand_description.startswith(key):
+            return val
+    return 0
 
 # --------------------------
-# 1. Opponent Range Estimation Model (Placeholder for later use)
+# (Old Dummy) Function to Predict Opponent's Cards
+# (Now replaced by the neural network from gto.py)
 # --------------------------
-class OpponentRangeModel(nn.Module):
-    def __init__(self, input_size, hidden_size, output_size):
-        super(OpponentRangeModel, self).__init__()
-        self.fc1 = nn.Linear(input_size, hidden_size)
-        self.fc2 = nn.Linear(hidden_size, output_size)
-
-    def forward(self, x):
-        x = F.relu(self.fc1(x))
-        # Using sigmoid to produce outputs between 0 and 1 (a dummy "range strength")
-        x = torch.sigmoid(self.fc2(x))
-        return x
-
+# def predict_opponent_cards(action):
+#     if action == "raise":
+#         return ["AH", "KH"]
+#     elif action == "call":
+#         return ["QD", "JC"]
+#     elif action == "check":
+#         return ["9S", "8S"]
+#     else:
+#         return []
 
 # --------------------------
-# Helper: Determine the current stage of the game
+# Monte Carlo Simulation to Estimate Win Rate
+# --------------------------
+def monte_carlo_win_rate(user_hole_cards, community_cards, num_opponents, num_simulations=500):
+    wins = 0
+    ties = 0
+    # Create a full deck of card strings
+    deck = [r+s for r in Card.valid_ranks for s in Card.valid_suits]
+    for _ in range(num_simulations):
+        # Remove known cards from the deck
+        known_cards = set(user_hole_cards + community_cards)
+        remaining_deck = [card for card in deck if card not in known_cards]
+        sim_community = community_cards.copy()
+        # Complete community cards if necessary (simulate board runout)
+        while len(sim_community) < 5:
+            card = random.choice(remaining_deck)
+            sim_community.append(card)
+            remaining_deck.remove(card)
+        # Evaluate user's hand
+        user_hand = PokerHand(user_hole_cards, sim_community)
+        user_strength = hand_rank_value(user_hand.evaluate())
+        opponent_strengths = []
+        # Copy remaining deck for opponent sampling
+        rem_deck_copy = remaining_deck.copy()
+        for _ in range(num_opponents):
+            opp_hand_cards = random.sample(rem_deck_copy, 2)
+            for card in opp_hand_cards:
+                rem_deck_copy.remove(card)
+            opp_hand = PokerHand(opp_hand_cards, sim_community)
+            opp_strength = hand_rank_value(opp_hand.evaluate())
+            opponent_strengths.append(opp_strength)
+        max_opp_strength = max(opponent_strengths) if opponent_strengths else 0
+        if user_strength > max_opp_strength:
+            wins += 1
+        elif user_strength == max_opp_strength:
+            ties += 1
+    win_rate = (wins + 0.5 * ties) / num_simulations
+    return win_rate
+
+# --------------------------
+# Helper: Determine the Current Stage of the Game
 # --------------------------
 def determine_stage(community_cards):
-    """Determine the current stage of the game based on the number of community cards."""
     if len(community_cards) == 0:
         return "Pre-Flop"
     elif len(community_cards) == 3:
@@ -179,17 +234,10 @@ def determine_stage(community_cards):
     else:
         return "Unknown Stage"
 
-
 # --------------------------
-# Helper: Infer player action from bet amounts
+# Helper: Infer Player Action from Bet Amounts
 # --------------------------
 def infer_actions(betting_order, bets):
-    """
-    Infers each player's action based on their bet.
-    If a player bets -1, that's a fold.
-    Otherwise, if the bet equals the current call amount, it is a check (if 0) or call.
-    If the bet is higher than the current call amount, it's a raise (and updates the call amount).
-    """
     current_call = 0.0
     actions = {}
     for pos in betting_order:
@@ -197,10 +245,7 @@ def infer_actions(betting_order, bets):
         if bet == -1:
             actions[pos] = "fold"
         elif bet == current_call:
-            if current_call == 0:
-                actions[pos] = "check"
-            else:
-                actions[pos] = "call"
+            actions[pos] = "check" if current_call == 0 else "call"
         elif bet > current_call:
             actions[pos] = "raise"
             current_call = bet
@@ -208,38 +253,54 @@ def infer_actions(betting_order, bets):
             actions[pos] = "call"
     return actions
 
+# --------------------------
+# Helper: Encode Opponent Features for GTO Predictor
+# --------------------------
+def encode_features(action, bet):
+    """
+    Encodes an opponent's betting behavior into a fixed-length feature vector.
+    Here we use a simple encoding:
+      - Action mapping: "raise" -> 1.0, "call" -> 0.5, "check" -> 0.0.
+      - Bet normalized (assume bet is in dollars; divide by 100).
+      - The remaining dimensions are padded with zeros to form a vector of size 10.
+    """
+    mapping = {"raise": 1.0, "call": 0.5, "check": 0.0}
+    action_val = mapping.get(action, 0.0)
+    bet_norm = bet / 100.0 if isinstance(bet, (int, float)) else 0.0
+    features = torch.zeros(10)
+    features[0] = action_val
+    features[1] = bet_norm
+    return features
 
 # --------------------------
-# Main Loop: Run rounds continuously
+# Main Loop: Run Rounds Continuously
 # --------------------------
 def main():
     print("Welcome to the AI Poker Win Rate Estimator!")
     print("Note: Use -1 as the bet amount to indicate a fold.")
     print("Positions: Dealer is player 0, Small Blind is player 1, Big Blind is player 2.\n")
 
-    # Game Setup: Get number of players and user position (0-indexed)
     num_players = int(input("Enter the number of players on the table: "))
     user_position = int(input("Enter your position (0-indexed): "))
 
-    # Validate minimum number of players (at least 3 are needed for Texas Hold'em)
     if num_players < 3:
         print("Error: Texas Hold'em requires at least 3 players.")
         return
 
-    # Get the user's hole cards once (memorized for subsequent rounds)
     user_cards_input = input("Enter your hole cards separated by a comma (e.g., AH, KD): ")
     user_cards = [card.strip().upper() for card in user_cards_input.split(",") if card.strip()]
 
+    # Instantiate the opponent card predictor (from gto.py)
+    predictor = OpponentCardPredictor(input_size=10, hidden_size=64, output_size=1326)
+    predictor.eval()  # Set to evaluation mode (assumes pretrained weights if available)
+
     round_counter = 1
-    # Initialize active players for the hand: all players start active
     active_players = list(range(num_players))
 
     while True:
-        print("\n=== Round {} ===".format(round_counter))
-        # If only one player remains, the hand is over.
+        print(f"\n=== Round {round_counter} ===")
         if len(active_players) == 1:
             print(f"Hand over! Only Player {active_players[0]} remains active.")
-            # Option to start a new hand (reset active players)
             new_hand = input("Start a new hand? (y/n): ")
             if new_hand.lower() != 'y':
                 print("Exiting the AI Poker Win Rate Estimator. Goodbye!")
@@ -249,24 +310,18 @@ def main():
                 round_counter = 1
                 continue
 
-        # Get community cards (if any) for the current round
         community_cards_input = input("Enter community cards separated by a comma (if none, leave blank): ")
         community_cards = [card.strip().upper() for card in community_cards_input.split(",") if card.strip()]
 
-        # Build the player's current PokerHand using the memorized hole cards and current community cards.
         current_hand = PokerHand(user_cards, community_cards)
-
-        # Determine current stage based on community cards
         stage = determine_stage(community_cards)
 
-        # Determine betting order based on stage then filter to active players.
         if stage == "Pre-Flop":
             full_order = list(range(3, num_players)) + [0, 1, 2]
         else:
             full_order = list(range(1, num_players)) + [0]
         betting_order = [pos for pos in full_order if pos in active_players]
 
-        # Get bets from players in the proper order (only for active players)
         bets = {}
         print("\n--- Enter Bets ---")
         for pos in betting_order:
@@ -280,53 +335,44 @@ def main():
                 bet = 0.0
             bets[pos] = bet
 
-        # Infer actions based on the bets and betting order
         actions = infer_actions(betting_order, bets)
-
-        # Update active players: remove any player who just folded
         for pos in betting_order:
             if actions[pos] == "fold" and pos in active_players:
                 active_players.remove(pos)
 
-        # Compute the current total cumulated bet for this round (ignoring folds)
         cumulated_bet = sum(bet for bet in bets.values() if bet != -1)
+        players_info = {pos: {"bet": bets.get(pos, "N/A"), "action": actions.get(pos, "N/A")}
+                        for pos in active_players}
 
-        # Build players_info only for active players
-        players_info = {}
-        for pos in active_players:
-            players_info[pos] = {
-                "bet": bets.get(pos, "N/A"),
-                "action": actions.get(pos, "N/A")
-            }
-
-        # Placeholder values for computed outputs
-        placeholder_win_rate = 50.0  # Dummy win rate (50%)
+        # Use the GTO predictor to predict opponents' hole cards
         opponents_predictions = {}
         for pos in active_players:
             if pos != user_position:
-                opponents_predictions[pos] = ["??", "??"]
+                # Encode features from the opponent's action and bet
+                feat = encode_features(actions.get(pos, "N/A"), bets.get(pos, 0.0))
+                predicted_cards = predictor.predict_cards(feat)
+                opponents_predictions[pos] = predicted_cards
 
-        # Print Game Summary for the round
+        num_opponents = len(active_players) - 1
+        win_rate = monte_carlo_win_rate(user_cards, community_cards, num_opponents, num_simulations=500)
+
         print("\n--- Game Summary ---")
         print(f"Current Stage: {stage}")
         print(f"User Position: {user_position}")
         print(f"User Hole Cards: {user_cards}")
         print("Community Cards:", community_cards if community_cards else "None")
-        print(f"Estimated Win Rate: {placeholder_win_rate:.2f}%")
+        print(f"Estimated Win Rate: {win_rate*100:.2f}%")
         print(f"Total Cumulated Bet (Pot): {cumulated_bet}\n")
         print(f"Your Best Hand: {current_hand}\n")
 
         print("Active Players Info:")
         for pos in active_players:
             if pos == user_position:
-                print(
-                    f"  Position {pos} (You) - Bet: {players_info[pos]['bet']}, Action: {players_info[pos]['action']}")
+                print(f"  Position {pos} (You) - Bet: {players_info[pos]['bet']}, Action: {players_info[pos]['action']}")
             else:
-                pred = opponents_predictions.get(pos, ["??", "??"])
-                print(
-                    f"  Position {pos} - Bet: {players_info[pos]['bet']}, Action: {players_info[pos]['action']}, Predicted Cards: {pred}")
+                pred = opponents_predictions.get(pos, ("??", "??"))
+                print(f"  Position {pos} - Bet: {players_info[pos]['bet']}, Action: {players_info[pos]['action']}, Predicted Cards: {pred}")
 
-        # Ask if the user wants to continue to the next betting round of the current hand.
         cont = input("\nContinue to next betting round? (y/n): ")
         if cont.lower() != 'y':
             print("Exiting the AI Poker Win Rate Estimator. Goodbye!")
@@ -334,6 +380,6 @@ def main():
 
         round_counter += 1
 
-
 if __name__ == "__main__":
     main()
+# end main.py
