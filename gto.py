@@ -1,9 +1,11 @@
-# gto.py
+# gto.py (extended with training example)
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import itertools
+import numpy as np
+from torch.utils.data import Dataset, DataLoader
 
 
 class OpponentCardPredictor(nn.Module):
@@ -78,20 +80,69 @@ class OpponentCardPredictor(nn.Module):
             return predicted_cards
 
 
-# If run as main, perform a simple test.
+# --------------------------
+# Example Dataset for Training
+# --------------------------
+class OpponentCardDataset(Dataset):
+    def __init__(self, features, labels):
+        """
+        Args:
+            features (np.array or torch.Tensor): Array of shape (N, input_size).
+            labels (np.array or torch.Tensor): Array of shape (N,) containing integer labels in [0, 1325].
+        """
+        self.features = torch.tensor(features, dtype=torch.float32)
+        self.labels = torch.tensor(labels, dtype=torch.long)
+
+    def __len__(self):
+        return len(self.features)
+
+    def __getitem__(self, idx):
+        return self.features[idx], self.labels[idx]
+
+
+# --------------------------
+# Training Loop Example
+# --------------------------
 if __name__ == "__main__":
-    # Example usage:
-    # Assume the input feature vector is of size 10 (you can adjust this as needed).
+    # For demonstration, we generate random training data.
+    # In practice, load your real dataset here.
     input_size = 10
+    num_samples = 1000  # Replace with your dataset size
+    # Create random feature vectors (e.g., encoded opponent actions)
+    features = np.random.randn(num_samples, input_size)
+    # Create random target labels (each an integer in [0, 1325])
+    labels = np.random.randint(0, 1326, size=(num_samples,))
+
+    dataset = OpponentCardDataset(features, labels)
+    dataloader = DataLoader(dataset, batch_size=32, shuffle=True)
+
+    # Instantiate the model.
     model = OpponentCardPredictor(input_size=input_size, hidden_size=64, output_size=1326)
 
-    # Create a dummy input (e.g., representing an opponent's betting features).
-    dummy_input = torch.randn(1, input_size)
+    # Define an optimizer and loss function.
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+    criterion = nn.CrossEntropyLoss()
 
-    # Get predicted probabilities over the 1326 starting hands.
-    probabilities = model(dummy_input)
-    print("Predicted probabilities shape:", probabilities.shape)
+    num_epochs = 20  # Adjust the number of epochs as needed
+    for epoch in range(num_epochs):
+        model.train()  # Set model to training mode
+        running_loss = 0.0
+        for batch_features, batch_labels in dataloader:
+            optimizer.zero_grad()
+            outputs = model(batch_features)  # Outputs shape: (batch_size, 1326)
+            loss = criterion(outputs, batch_labels)
+            loss.backward()
+            optimizer.step()
+            running_loss += loss.item() * batch_features.size(0)
 
-    # Get the most likely predicted opponent cards.
-    predicted = model.predict_cards(dummy_input[0])
-    print("Predicted opponent cards:", predicted)
+        epoch_loss = running_loss / len(dataset)
+        print(f"Epoch {epoch + 1}/{num_epochs}, Loss: {epoch_loss:.4f}")
+
+    # Save the model weights (optional)
+    torch.save(model.state_dict(), "opponent_card_predictor.pth")
+
+    # Example usage of the trained model
+    model.eval()
+    dummy_input = torch.randn(input_size)  # Single sample feature vector
+    predicted_cards = model.predict_cards(dummy_input)
+    print("Predicted opponent cards for dummy input:", predicted_cards)
